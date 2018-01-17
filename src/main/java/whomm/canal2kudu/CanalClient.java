@@ -138,8 +138,9 @@ public class CanalClient {
 
 	}
 
-	protected void process() {
+	protected void process()  {
 		int batchSize = Integer.parseInt(BATCHNUM);
+		int errorcount = 0;
 		while (running) {
 			try {
 				connector.connect();
@@ -156,6 +157,7 @@ public class CanalClient {
 						int size = message.getEntries().size();
 						if (batchId == -1 || size == 0) {
 							try {
+								logger.debug("get nothing waiting");
 								Thread.sleep(100);
 							} catch (InterruptedException e) {
 							}
@@ -163,6 +165,7 @@ public class CanalClient {
 							//KuduTable kdtable = kdclient.openTable(KDTABLENAME);
 							//KuduSession kdsession = kdclient.newSession();
 							kafkaEntry(message.getEntries() /*, kdtable, kdsession*/);
+							logger.debug("process ok");
 							//kdsession.flush();
 							//kdsession.close();
 
@@ -176,8 +179,14 @@ public class CanalClient {
 					
 					//kdclient.close();
 				}
-			} catch (Exception e) {
+				
+			}
+			catch (Exception e) {
 				logger.error("process error!", e);
+				errorcount++;
+				if(errorcount>6){
+					break;
+				}
 			} finally {
 				connector.disconnect();
 			}
@@ -216,7 +225,10 @@ public class CanalClient {
 			if (!DBTABLENAME.equals("") && !tablename.equals(DBTABLENAME)) {
 				continue;
 			}
+			
+			
 			String kdtablename = KDTABLENAME.equals("")?tablename:KDTABLENAME;
+			logger.debug("open kudu table :" + kdtablename);
 			KuduTable kuduTable = kdclient.openTable(kdtablename);
 
 			RowChange rowChage = null;
