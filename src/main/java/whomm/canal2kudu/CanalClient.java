@@ -63,6 +63,8 @@ public class CanalClient {
 	private static final String BATCHNUM = System.getProperty("BatchNum",
 			"1024");
 
+	private static final String[] idStrList = { "id", "ID", "Id", "iD" };
+
 	public static void main(String args[]) {
 
 		// 基于zookeeper动态获取canal server的地址，建立链接，其中一台server发生crash，可以支持failover
@@ -138,17 +140,12 @@ public class CanalClient {
 
 	}
 
-	protected void process()  {
+	protected void process() {
 		int batchSize = Integer.parseInt(BATCHNUM);
-		int errorcount = 0;
 		while (running) {
 			try {
 				connector.connect();
 				connector.subscribe();
-
-				//KuduClient kdclient = new KuduClient.KuduClientBuilder(KUDU_MASTER).build();
-
-				
 
 				while (running) {
 					Message message = connector.getWithoutAck(batchSize); // 获取指定数量的数据
@@ -162,31 +159,34 @@ public class CanalClient {
 							} catch (InterruptedException e) {
 							}
 						} else {
-							//KuduTable kdtable = kdclient.openTable(KDTABLENAME);
-							//KuduSession kdsession = kdclient.newSession();
-							kafkaEntry(message.getEntries() /*, kdtable, kdsession*/);
-							logger.debug("process ok");
-							//kdsession.flush();
-							//kdsession.close();
 
+							KuduEntry(message.getEntries());
+							logger.debug("process ok");
 						}
 
 						connector.ack(batchId); // 提交确认
-					} catch (Exception e) {
+
+					} catch (IllegalStateException e4) {
+						//kudu 数据类型
+						e4.printStackTrace();
 						connector.rollback(batchId); // 处理失败, 回滚数据
+						running = false;
+						
+					} catch (KuduException e3) {
+						//kudu 的异常
+						e3.printStackTrace();
+						connector.rollback(batchId); // 处理失败, 回滚数据
+						running = false;
+					} catch (Exception e) {
+						e.printStackTrace();
+						connector.rollback(batchId); // 处理失败, 回滚数据
+						break;
 					}
 
-					
-					//kdclient.close();
 				}
-				
-			}
-			catch (Exception e) {
+
+			} catch (Exception e) {
 				logger.error("process error!", e);
-				errorcount++;
-				if(errorcount>6){
-					break;
-				}
 			} finally {
 				connector.disconnect();
 			}
@@ -203,33 +203,37 @@ public class CanalClient {
 				+ format.format(date) + ")";
 	}
 
-	private void kafkaEntry(List<Entry> entrys/*, KuduTable kuduTable,
-			KuduSession kdsession*/) throws InterruptedException,
-			ExecutionException, KuduException {
-		
-		
-		KuduClient kdclient = new KuduClient.KuduClientBuilder(
-				KUDU_MASTER).build();
-		
+	private void KuduEntry(List<Entry> entrys) throws Exception {
+
+		KuduClient kdclient = new KuduClient.KuduClientBuilder(KUDU_MASTER)
+				.build();
+
 		KuduSession kdsession = kdclient.newSession();
-		
+
 		for (Entry entry : entrys) {
 
 			logger.info(buildPositionForDump(entry));
 			if (entry.getEntryType() == EntryType.TRANSACTIONBEGIN
 					|| entry.getEntryType() == EntryType.TRANSACTIONEND) {
+				logger.info("filter TRANSACTIONBEGIN continue");
 				continue;
 			}
 			String tablename = entry.getHeader().getTableName();
 			// 过滤对应的数据库表格
 			if (!DBTABLENAME.equals("") && !tablename.equals(DBTABLENAME)) {
+				logger.info("filter table :" + DBTABLENAME + " continue");
 				continue;
 			}
-			
-			
-			String kdtablename = KDTABLENAME.equals("")?tablename:KDTABLENAME;
+
+			String kdtablename = KDTABLENAME.equals("") ? tablename
+					: KDTABLENAME;
 			logger.debug("open kudu table :" + kdtablename);
-			KuduTable kuduTable = kdclient.openTable(kdtablename);
+			KuduTable kuduTable;
+			try {
+				kuduTable = kdclient.openTable(kdtablename);
+			} catch (KuduException e1) {
+				throw e1;
+			}
 
 			RowChange rowChage = null;
 			try {
@@ -256,12 +260,72 @@ public class CanalClient {
 										.newDelete();
 								PartialRow row = KdDelete.getRow();
 								Schema colSchema = kuduTable.getSchema();
-								row.addLong(colSchema.getColumnIndex("id"),
-										Long.parseLong(column.getValue()));
+								int idindex = -1;
 
-								kdsession.apply(KdDelete);
+								for (String idname : idStrList) {
+									try {
+										idindex = colSchema
+												.getColumnIndex(idname);
+									} catch (IllegalArgumentException e) {
+										continue;
+									}
+								}
 
-								break;
+								if (idindex >= 0) {
+									switch (colSchema.getColumnByIndex(idindex)
+											.getType().getDataType()) {
+
+									case BOOL:
+										row.addBoolean(idindex,
+												Boolean.parseBoolean(column
+														.getValue()));
+										break;
+									case FLOAT:
+										row.addFloat(idindex, Float
+												.parseFloat(column.getValue()));
+										break;
+									case DOUBLE:
+										row.addDouble(idindex, Double
+												.parseDouble(column.getValue()));
+										break;
+									case BINARY:
+										row.addBinary(idindex, column
+												.getValue().getBytes());
+										break;
+									case INT8:
+									case INT16:
+										row.addShort(idindex, Short
+												.parseShort(column.getValue()));
+									case INT32:
+										row.addInt(idindex, Integer
+												.parseInt(column.getValue()));
+										break;
+									case INT64:
+										row.addLong(idindex, Long
+												.parseLong(column.getValue()));
+										break;
+									case STRING:
+										row.addString(idindex,
+												column.getValue());
+										break;
+									default:
+										throw new IllegalStateException(
+												String.format(
+														"unknown column type %s",
+														colSchema
+																.getColumnByIndex(
+																		idindex)
+																.getType()
+																.getDataType()));
+
+									}
+									kdsession.apply(KdDelete);
+									break;
+
+								}
+
+								throw new IllegalStateException(
+										"cannot find index id");
 							}
 						}
 
@@ -280,49 +344,41 @@ public class CanalClient {
 							Type colType = colSchema.getColumnByIndex(colIdx)
 									.getType();
 
-							try {
-								switch (colType.getDataType()) {
-								case BOOL:
-									row.addBoolean(colIdx, Boolean
-											.parseBoolean(column.getValue()));
-									break;
-								case FLOAT:
-									row.addFloat(colIdx,
-											Float.parseFloat(column.getValue()));
-									break;
-								case DOUBLE:
-									row.addDouble(colIdx, Double
-											.parseDouble(column.getValue()));
-									break;
-								case BINARY:
-									row.addBinary(colIdx, column.getValue()
-											.getBytes());
-									break;
-								case INT8:
-								case INT16:
-									row.addShort(colIdx,
-											Short.parseShort(column.getValue()));
-								case INT32:
-									row.addInt(colIdx,
-											Integer.parseInt(column.getValue()));
-									break;
-								case INT64:
-									row.addLong(colIdx,
-											Long.parseLong(column.getValue()));
-									break;
-								case STRING:
-									row.addString(colIdx, column.getValue());
-									break;
-								default:
-									throw new IllegalStateException(
-											String.format(
-													"unknown column type %s",
-													colType));
-								}
-
-							} catch (Exception e) {
-								// TODO Auto-generated catch block
-								e.printStackTrace();
+							switch (colType.getDataType()) {
+							case BOOL:
+								row.addBoolean(colIdx,
+										Boolean.parseBoolean(column.getValue()));
+								break;
+							case FLOAT:
+								row.addFloat(colIdx,
+										Float.parseFloat(column.getValue()));
+								break;
+							case DOUBLE:
+								row.addDouble(colIdx,
+										Double.parseDouble(column.getValue()));
+								break;
+							case BINARY:
+								row.addBinary(colIdx, column.getValue()
+										.getBytes());
+								break;
+							case INT8:
+							case INT16:
+								row.addShort(colIdx,
+										Short.parseShort(column.getValue()));
+							case INT32:
+								row.addInt(colIdx,
+										Integer.parseInt(column.getValue()));
+								break;
+							case INT64:
+								row.addLong(colIdx,
+										Long.parseLong(column.getValue()));
+								break;
+							case STRING:
+								row.addString(colIdx, column.getValue());
+								break;
+							default:
+								throw new IllegalStateException(String.format(
+										"unknown column type %s", colType));
 							}
 
 						}
@@ -336,11 +392,10 @@ public class CanalClient {
 				}
 
 			}
-			
+
 			kdsession.flush();
 			kdsession.close();
 			kdclient.close();
-			
 
 		}
 
